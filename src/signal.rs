@@ -1,8 +1,10 @@
-//! Per-mapping BrdU signal extraction, mirroring `parsing_DoradoRemora_v18_Br.r`
+//! Per-mapping modification signal extraction, mirroring `parsing_DoradoRemora_v18_Br.r`
 //! (read.bam.batch -> process.mod.tag -> process.signal -> signalbin).
 
-use crate::bam::{self, BASE_A, BASE_T, OP_D, OP_I, OP_M, OP_N, OP_S, Record, Tag};
-use crate::rstats::{r_mean, r_median, r_median_ml};
+use crate::bam::{self, OP_D, OP_I, OP_M, OP_N, OP_S, Record, Tag};
+use anyhow::{Result, bail};
+use crate::rstats::{self, r_mean, r_median, r_median_ml};
+use crate::x87;
 
 pub struct Params {
     pub min_len: i64,
@@ -10,6 +12,108 @@ pub struct Params {
     pub keep_supplementary: bool,
     /// chromosomes whose name starts with any of these are skipped (step 01 `$3 !~ /^chrM/`)
     pub exclude_prefixes: Vec<String>,
+    /// modification to extract (R: "T+B")
+    pub modspec: ModSpec,
+    /// value used in signalB for each ML code: code/255, or 0/1 when binarised with
+    /// R's `binarise`/`bin_thr` (`prob < thr ? 0 : 1`); med_signal always uses raw probabilities
+    pub bin_values: [f64; 256],
+}
+
+impl Params {
+    pub fn bin_values(binarise: Option<f64>) -> [f64; 256] {
+        std::array::from_fn(|c| {
+            let prob = c as f64 / 255.0;
+            match binarise {
+                Some(thr) => if prob < thr { 0.0 } else { 1.0 },
+                None => prob,
+            }
+        })
+    }
+}
+
+/// A modification as written in the MM tag: canonical base, strand, code
+/// (one letter like `B`, `m`, `a`, or a ChEBI number like `17802`).
+#[derive(Clone, Debug)]
+pub struct ModSpec {
+    pub base: u8,
+    pub code: Vec<u8>,
+    /// 4-bit BAM code of the base to scan on + reads, and on - reads (complement)
+    fwd_code: u8,
+    rev_code: u8,
+}
+
+fn base_code(b: u8) -> Option<u8> {
+    Some(match b {
+        b'A' => 1,
+        b'C' => 2,
+        b'G' => 4,
+        b'T' => 8,
+        b'N' => 15,
+        _ => return None,
+    })
+}
+
+fn complement(b: u8) -> u8 {
+    match b {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'C' => b'G',
+        b'G' => b'C',
+        x => x,
+    }
+}
+
+impl ModSpec {
+    /// Parses e.g. "T+B", "C+m", "A+a", "C+17802".
+    pub fn parse(s: &str) -> Result<Self> {
+        let b = s.as_bytes();
+        if b.len() < 3 || base_code(b[0]).is_none() {
+            bail!("invalid --mod '{s}': expected <base><strand><code>, e.g. T+B or C+m");
+        }
+        if b[1] != b'+' {
+            bail!("invalid --mod '{s}': only '+' strand modifications are supported");
+        }
+        let code = b[2..].to_vec();
+        let ok = code.iter().all(|c| c.is_ascii_digit()) || (code.len() == 1 && code[0].is_ascii_alphabetic());
+        if !ok {
+            bail!("invalid --mod '{s}': code must be one letter (e.g. m) or a ChEBI number");
+        }
+        Ok(ModSpec {
+            base: b[0],
+            code,
+            fwd_code: base_code(b[0]).unwrap(),
+            rev_code: base_code(complement(b[0])).unwrap(),
+        })
+    }
+
+    /// If this MM entry code (e.g. "C+mh.") holds our modification, returns
+    /// (index of our code within the entry, number of codes in the entry).
+    fn find_in(&self, entry: &[u8]) -> Option<(usize, usize)> {
+        if entry.len() < 3 || entry[0] != self.base || entry[1] != b'+' {
+            return None;
+        }
+        let codes = match entry.last() {
+            Some(b'.') | Some(b'?') => &entry[2..entry.len() - 1],
+            _ => &entry[2..],
+        };
+        if codes.iter().all(|c| c.is_ascii_digit()) {
+            return (codes == self.code.as_slice()).then_some((0, 1));
+        }
+        let i = codes.iter().position(|c| self.code.len() == 1 && *c == self.code[0])?;
+        Some((i, codes.len()))
+    }
+}
+
+/// Number of modification codes in an MM entry code (ML values per position).
+fn n_codes(entry: &[u8]) -> usize {
+    if entry.len() < 3 {
+        return 1;
+    }
+    let codes = match entry.last() {
+        Some(b'.') | Some(b'?') => &entry[2..entry.len() - 1],
+        _ => &entry[2..],
+    };
+    if codes.is_empty() || codes.iter().all(|c| c.is_ascii_digit()) { 1 } else { codes.len() }
 }
 
 pub struct Mapping {
@@ -19,7 +123,7 @@ pub struct Mapping {
     pub minus: bool,
     pub start: i64,
     pub end: i64,
-    /// (bin start position, mean BrdU probability)
+    /// (bin start position, mean modification probability)
     pub bins: Vec<(f64, f64)>,
     pub med_signal: f64,
     pub med_signalbin: f64,
@@ -141,20 +245,23 @@ pub fn extract(
         }
     };
 
-    // --- process.mod.tag: probabilities for each T in read orientation ---
-    // In read orientation, T's are BAM-seq T's (+) or BAM-seq A's read backwards (-).
-    let target = if minus { BASE_A } else { BASE_T };
+    // --- process.mod.tag: probabilities for each target base in read orientation ---
+    // In read orientation, the target bases are BAM-seq bases (+) or complements read
+    // backwards (-). Base N means every position (R's `type_base == "N"` branch).
+    let ms = &p.modspec;
+    let any_base = ms.base == b'N';
+    let target = if minus { ms.rev_code } else { ms.fwd_code };
     let tpos = &mut scratch.tpos; // BAM-orientation 0-based indices, in read-orientation order
     tpos.clear();
     if minus {
         for i in (0..rec.l_seq).rev() {
-            if rec.base_code(i) == target {
+            if any_base || rec.base_code(i) == target {
                 tpos.push(i as u32);
             }
         }
     } else {
         for i in 0..rec.l_seq {
-            if rec.base_code(i) == target {
+            if any_base || rec.base_code(i) == target {
                 tpos.push(i as u32);
             }
         }
@@ -164,41 +271,42 @@ pub fn extract(
     let probs = &mut scratch.probs;
     probs.clear();
     let mut ml_off = 0usize;
-    let mut found_b = false;
+    let mut found = false;
     let mm = mm.strip_suffix(b";").unwrap_or(mm);
     for entry in mm.split(|&c| c == b';') {
         let mut fields = entry.split(|&c| c == b',');
         let code = fields.next().unwrap_or(b"");
         let n_rel = fields.clone().count();
-        let (code_core, unreported) = match code.last() {
-            Some(b'?') => (&code[..code.len() - 1], NONE),
-            Some(b'.') => (&code[..code.len() - 1], 0u16),
-            _ => (code, 0u16),
-        };
-        if code_core == b"T+B" && !found_b {
-            found_b = true;
-            probs.resize(tpos.len(), unreported);
-            let mut idx = 0usize;
-            for (i, f) in fields.enumerate() {
-                let rel: usize = std::str::from_utf8(f).ok()?.trim().parse().ok()?;
-                idx += rel + 1;
-                let v = *ml.get(ml_off + i)? as u16;
-                if idx > probs.len() {
-                    // R would fail on this record (more calls than T's); skip it
-                    cnt.mm_overflow += 1;
-                    return None;
+        let k = n_codes(code);
+        if !found {
+            if let Some((ci, _)) = ms.find_in(code) {
+                found = true;
+                // '.' -> unreported bases are 0; '?' (or base N, where R only keeps listed
+                // positions) -> unreported bases are dropped
+                let unreported = if code.last() == Some(&b'?') || any_base { NONE } else { 0u16 };
+                probs.resize(tpos.len(), unreported);
+                let mut idx = 0usize;
+                for (i, f) in fields.enumerate() {
+                    let rel: usize = std::str::from_utf8(f).ok()?.trim().parse().ok()?;
+                    idx += rel + 1;
+                    let v = *ml.get(ml_off + i * k + ci)? as u16;
+                    if idx > probs.len() {
+                        // R would fail on this record (more calls than bases); skip it
+                        cnt.mm_overflow += 1;
+                        return None;
+                    }
+                    probs[idx - 1] = v;
                 }
-                probs[idx - 1] = v;
             }
         }
-        ml_off += n_rel;
+        ml_off += n_rel * k;
     }
-    if !found_b {
+    if !found {
         return None;
     }
 
     // --- process.signal: map to reference, keep positions in [start, end] ---
-    // Iterate T's in ascending BAM query order so reference positions are ascending.
+    // Iterate target bases in ascending BAM query order so reference positions are ascending.
     let signal = &mut scratch.signal;
     signal.clear();
     let shift = read_length - rec.l_seq as i64; // mod_pos = read_length - (p - 1) with p = l_seq - j
@@ -240,21 +348,31 @@ pub fn extract(
 
     let bs = p.bin_size;
     let mut bins: Vec<(f64, f64)> = Vec::new();
-    let vals = &mut scratch.vals;
-    vals.clear();
+    let Scratch { codes, vals, x87, .. } = scratch;
+    let x87 = x87.get_or_insert_with(|| Box::new(x87::CodeMean::new(&p.bin_values)));
+    let mut bin_mean = |codes: &[u8]| -> f64 {
+        if rstats::x87_enabled() {
+            x87.mean(codes)
+        } else {
+            vals.clear();
+            vals.extend(codes.iter().map(|&c| p.bin_values[c as usize]));
+            r_mean(vals)
+        }
+    };
+    codes.clear();
     let mut cur_bin = i64::MIN;
     for &(r, c) in signal.iter() {
         let b = (r - 1).div_euclid(bs) * bs + 1;
         if b != cur_bin {
-            if !vals.is_empty() {
-                bins.push((cur_bin as f64, r_mean(vals)));
-                vals.clear();
+            if !codes.is_empty() {
+                bins.push((cur_bin as f64, bin_mean(codes)));
+                codes.clear();
             }
             cur_bin = b;
         }
-        vals.push(c as f64 / 255.0);
+        codes.push(c);
     }
-    bins.push((cur_bin as f64, r_mean(vals)));
+    bins.push((cur_bin as f64, bin_mean(codes)));
     let mut bvals: Vec<f64> = bins.iter().map(|b| b.1).collect();
     let med_signalbin = r_median(&mut bvals);
 
@@ -287,6 +405,8 @@ pub struct Scratch {
     probs: Vec<u16>,
     signal: Vec<(i64, u8)>,
     vals: Vec<f64>,
+    codes: Vec<u8>,
+    x87: Option<Box<x87::CodeMean>>,
 }
 
 /// Size of the intersection of two sorted, disjoint interval lists.
@@ -359,6 +479,27 @@ pub fn supp_filter(mut maps: Vec<Mapping>, max_dist: i64) -> (Vec<Mapping>, u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modspec_parsing_and_matching() {
+        let b = ModSpec::parse("T+B").unwrap();
+        assert_eq!(b.find_in(b"T+B."), Some((0, 1)));
+        assert_eq!(b.find_in(b"T+B?"), Some((0, 1)));
+        assert_eq!(b.find_in(b"T+B"), Some((0, 1)));
+        assert_eq!(b.find_in(b"T+e."), None);
+        assert_eq!(b.find_in(b"C+B."), None);
+        let h = ModSpec::parse("C+h").unwrap();
+        assert_eq!(h.find_in(b"C+mh."), Some((1, 2)));
+        assert_eq!(n_codes(b"C+mh."), 2);
+        let chebi = ModSpec::parse("C+17802").unwrap();
+        assert_eq!(chebi.find_in(b"C+17802?"), Some((0, 1)));
+        assert_eq!(chebi.find_in(b"C+1780."), None);
+        assert_eq!(n_codes(b"C+17802."), 1);
+        assert!(ModSpec::parse("T-B").is_err());
+        assert!(ModSpec::parse("X+B").is_err());
+        assert!(ModSpec::parse("C+mh").is_err());
+        assert!(ModSpec::parse("T+").is_err());
+    }
 
     #[test]
     fn interval_overlap() {

@@ -138,8 +138,6 @@ impl<'a> Record<'a> {
     }
 }
 
-pub const BASE_A: u8 = 1;
-pub const BASE_T: u8 = 8;
 
 pub enum Tag<'a> {
     /// Z or H string (without NUL)

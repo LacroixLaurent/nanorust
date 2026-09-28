@@ -1,10 +1,29 @@
 //! Replicas of R's `mean()` and `median()` numerics.
 //!
-//! R computes `mean` in two passes with a LDOUBLE accumulator (80-bit on x86
-//! Linux, 64-bit on arm64 macOS). We use f64, which is bit-identical to R on
-//! arm64 and within ~1e-15 relative of R on x86.
+//! R computes `mean` in two passes with a LDOUBLE accumulator: 80-bit x87 on
+//! x86-64 Linux (emulated in `x87.rs`, default) or 64-bit on arm64 macOS.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static X87: AtomicBool = AtomicBool::new(true);
+
+/// Selects the LDOUBLE flavour of R's mean: x87 80-bit (R on x86-64 Linux,
+/// the default) or plain f64 (R on arm64 macOS).
+pub fn set_x87(on: bool) {
+    X87.store(on, Ordering::Relaxed);
+}
+
+pub fn x87_enabled() -> bool {
+    X87.load(Ordering::Relaxed)
+}
+
+/// R's `mean()` using the configured long-double flavour.
+#[inline]
 pub fn r_mean(x: &[f64]) -> f64 {
+    if X87.load(Ordering::Relaxed) { crate::x87::r_mean_x87(x) } else { r_mean_f64(x) }
+}
+
+pub fn r_mean_f64(x: &[f64]) -> f64 {
     let n = x.len() as f64;
     let mut s = 0.0f64;
     for &v in x {

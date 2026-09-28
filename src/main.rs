@@ -5,6 +5,7 @@ mod coverage;
 mod rds;
 mod rstats;
 mod signal;
+mod x87;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -46,6 +47,14 @@ struct RunArgs {
     /// output compression share this budget, e.g. set it to HTCondor/SLURM's allocated CPUs
     #[arg(short, long)]
     threads: Option<usize>,
+    /// Modification to extract, as in the MM tag: <base><strand><code>, e.g. T+B (BrdU),
+    /// T+e (EdU), C+m (5mC), C+h (5hmC), A+a (6mA), or a ChEBI code like C+17802
+    #[arg(long = "mod", default_value = "T+B")]
+    modification: String,
+    /// Binarise probabilities for signalbin: prob < THR -> 0, else 1 (R's binarise/bin_thr).
+    /// med_signal is still computed on raw probabilities, as in R
+    #[arg(long, value_name = "THR")]
+    binarise: Option<f64>,
     /// Drop supplementary mappings (default keeps them like parsing_DoradoRemora_v18_Br.r)
     #[arg(long)]
     no_supplementary: bool,
@@ -67,6 +76,16 @@ struct RunArgs {
     /// gzip level of the RDS (R's saveRDS uses 6)
     #[arg(long, default_value_t = 6)]
     rds_level: u32,
+    /// Floating-point flavour of R's mean(): "x87" reproduces R on x86-64 Linux
+    /// (80-bit long double), "f64" reproduces R on arm64 macOS
+    #[arg(long, value_enum, default_value_t = FloatMode::X87)]
+    float_mode: FloatMode,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum FloatMode {
+    X87,
+    F64,
 }
 
 fn main() -> Result<()> {
@@ -85,6 +104,7 @@ const BATCH_BYTES: usize = 8 << 20;
 
 fn run(mut a: RunArgs) -> Result<()> {
     let t0 = Instant::now();
+    rstats::set_x87(matches!(a.float_mode, FloatMode::X87));
     if let Some(p) = &a.out_prefix {
         a.rds.get_or_insert_with(|| format!("{p}_nanoT_alldata.rds").into());
         a.bw.get_or_insert_with(|| format!("{p}.bw").into());
@@ -104,6 +124,8 @@ fn run(mut a: RunArgs) -> Result<()> {
         bin_size: a.bin_size,
         keep_supplementary: !a.no_supplementary,
         exclude_prefixes: a.exclude_prefix.clone(),
+        modspec: signal::ModSpec::parse(&a.modification)?,
+        bin_values: signal::Params::bin_values(a.binarise),
     };
     let cov_bin = a.cov_bin_size;
 
@@ -192,7 +214,7 @@ fn run(mut a: RunArgs) -> Result<()> {
         counters.records,
         counters.candidates,
         counters.mappings,
-        if counters.mm_overflow > 0 { format!(", {} skipped (MM longer than T count)", counters.mm_overflow) } else { String::new() }
+        if counters.mm_overflow > 0 { format!(", {} skipped (more MM calls than target bases)", counters.mm_overflow) } else { String::new() }
     );
 
     let (maps, missing_mq) = signal::supp_filter(maps, a.max_dist);

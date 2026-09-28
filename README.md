@@ -44,6 +44,9 @@ nanorust run -b mod_calls_FP27_ES1_tel1rif1rif2_RefBT1mono_modl610FT11.bam \
 | `--bin-size` | 1000 | signalbin bin size |
 | `--cov-bin-size` | 50 | bamCoverage `--binSize` |
 | `--exclude-prefix` | chrM | chromosomes excluded from the signal (step 01 `^chrM`) |
+| `--mod` | T+B | modification to extract, as in the MM tag: `T+B` (BrdU), `T+e` (EdU), `C+m`, `C+h`, `A+a`, `C+17802`, … |
+| `--binarise THR` | off | R's `binarise`/`bin_thr`: `signalB` uses `prob < THR ? 0 : 1` (`med_signal` stays raw) |
+| `--float-mode` | x87 | `x87` = R on x86-64 Linux (80-bit long double), `f64` = R on arm64 macOS |
 
 ### CPU budget (`-t`)
 
@@ -71,8 +74,9 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 
 * **Filters** – mapped, non-secondary, not `chrM*`, has `MM`/`ML`; flag 0/16, or 2048/2064 when the
   first `SA` entry is on the same chrom and strand; `end - start > min_len` with `rlen = M + D`.
-* **Mod tags** – `T+B` calls over the T's of the read-oriented sequence, `.` → unreported = 0,
-  `?` → dropped, `ML/255`.
+* **Mod tags** – the `--mod` calls (default `T+B`) over the target bases of the read-oriented
+  sequence (complement on minus reads; every base for `N`), `.` → unreported = 0, `?` → dropped,
+  `ML/255`; combined entries such as `C+mh` are supported.
 * **CIGAR mapping** – `parseCigar` semantics (M maps, I/S advance query, D/N advance reference,
   minus-strand flip using `max(read_pos)`), positions kept in `[start, end]`.
 * **Binning** – `floor((pos-1)/1000)*1000+1`, mean per bin; `med_signal`, `med_signalbin` with R's
@@ -88,8 +92,12 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 
 * **Row order**: rows are sorted by `(chrom, read_id, flag, start)` over the whole file; R orders
   within each 10k-read chunk. `supp_filter` also runs per whole read instead of per chunk.
-* **Floating point**: R accumulates means in 80-bit long double on x86 Linux; nanorust uses f64
-  (like R on Apple Silicon). Doubles differ by ≤ 1e-14 relative; everything else is identical.
+* **Floating point**: R's `mean()` accumulates in `long double`, which is 80-bit x87 on x86-64
+  Linux. nanorust emulates it in software (default `--float-mode x87`), so values are bit-identical
+  to R on Linux on any machine; `--float-mode f64` reproduces R on Apple Silicon instead.
+* **Downstream row-order effect**: step 04's `mean`/`var` sum `signalB` in `alldata` row order, so
+  with nanorust's order `mean_br_bin`/`varbin` can differ from the R pipeline in the last bit
+  (≤ 4e-16); `nbin` and the median filter are identical. With rows in R's order, step 04 is identical.
 * The bigWig has the same values/intervals but is not byte-identical (different writer library).
 
 ## Validation
@@ -98,9 +106,11 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 scripts/validate.sh sample/chrI.bam ref_nanoT_alldata.rds ref.bw chrI
 ```
 
-Whole-genome FP27_ES1_tel1rif1rif2 (1,296,021 records, 11 GB): the same 313,924 mappings as R, identical
-ids, flags, positions, factors and bin positions; doubles ≤ 1.3e-14 relative; `med_signal`
-bit-identical; coverage bigWig identical at every base on all 17 chromosomes (same intervals).
+* Whole genome, FP27_ES1_tel1rif1rif2 (1,296,021 records, 11 GB): the same 313,924 mappings as R;
+  coverage bigWig identical at every base on all 17 chromosomes (same intervals).
+* chrI, chrVI, chrXII (105,307 mappings) with `--float-mode x87`: `alldata` is `identical()` to the
+  Linux R output after ordering, every value bit for bit.
+* Other modifications and combined MM codes: end-to-end tests on relabelled/rewritten BAMs.
 
 ## License
 
