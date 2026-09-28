@@ -18,16 +18,18 @@ jobs:
       - run: cargo test --release
       - run: cargo build --release
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Builds release binaries on every push; publishes them only for v* tags.
+  build:
     needs: test
     permissions:
       contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: true }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: true }
+          # Linux: native builds with musl-gcc -> fully static binaries
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, musl: true }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
@@ -36,19 +38,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Build (static musl via zig)
-        if: matrix.zig
-        run: |
-          pip install ziglang cargo-zigbuild
-          cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Install musl-gcc
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        if: ${{ !matrix.zig }}
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Check binary
+        run: |
+          bin=target/${{ matrix.target }}/release/nanorust
+          file $bin
+          if [ "${{ matrix.target }}" != "x86_64-apple-darwin" ]; then $bin --version; fi
       - name: Package
         run: |
           name=nanorust-${GITHUB_REF_NAME}-${{ matrix.target }}
           tar czf $name.tar.gz -C target/${{ matrix.target }}/release nanorust
           echo "ASSET=$name.tar.gz" >> $GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanorust-${{ matrix.target }}
+          path: ${{ env.ASSET }}
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: ${{ env.ASSET }}
