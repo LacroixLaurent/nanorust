@@ -2,8 +2,9 @@
 //!
 //! A reader thread groups compressed BGZF blocks, worker threads inflate the
 //! groups (with CRC32 check), and `ParallelBgzfReader` hands the decompressed
-//! stream back in file order.
+//! stream back in file order. `InlineBgzfReader` is the single-thread variant.
 
+use crate::budget::Budget;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, bounded};
 use std::collections::BTreeMap;
@@ -90,7 +91,8 @@ fn inflate_group(d: &mut libdeflater::Decompressor, data: &[u8], blocks: &[(usiz
 }
 
 impl ParallelBgzfReader {
-    pub fn new<R: Read + Send + 'static>(mut inner: R, workers: usize) -> Self {
+    /// `workers` inflate threads, each holding a `budget` permit while inflating.
+    pub fn new<R: Read + Send + 'static>(mut inner: R, workers: usize, budget: Budget) -> Self {
         let workers = workers.max(1);
         let (gtx, grx) = bounded::<Group>(workers * 4);
         let (otx, orx) = bounded::<Inflated>(workers * 4);
@@ -119,11 +121,15 @@ impl ParallelBgzfReader {
         });
         let handles = (0..workers)
             .map(|_| {
-                let (grx, otx) = (grx.clone(), otx.clone());
+                let (grx, otx, budget) = (grx.clone(), otx.clone(), budget.clone());
                 std::thread::spawn(move || {
                     let mut d = libdeflater::Decompressor::new();
                     for (seq, data, blocks) in grx {
-                        if otx.send((seq, inflate_group(&mut d, &data, &blocks))).is_err() {
+                        let out = {
+                            let _permit = budget.acquire();
+                            inflate_group(&mut d, &data, &blocks)
+                        };
+                        if otx.send((seq, out)).is_err() {
                             return;
                         }
                     }
@@ -192,5 +198,39 @@ impl Drop for ParallelBgzfReader {
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Single-threaded BGZF reader (used with `-t 1`): inflates block by block
+/// in the calling thread, no helper threads.
+pub struct InlineBgzfReader<R> {
+    inner: R,
+    d: libdeflater::Decompressor,
+    block: Vec<u8>,
+    cur: Vec<u8>,
+    pos: usize,
+}
+
+impl<R: Read> InlineBgzfReader<R> {
+    pub fn new(inner: R) -> Self {
+        InlineBgzfReader { inner, d: libdeflater::Decompressor::new(), block: Vec::new(), cur: Vec::new(), pos: 0 }
+    }
+}
+
+impl<R: Read> Read for InlineBgzfReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.cur.len() {
+            self.block.clear();
+            if !read_block(&mut self.inner, &mut self.block).map_err(|e| io::Error::other(e.to_string()))? {
+                return Ok(0);
+            }
+            let n = self.block.len();
+            self.cur = inflate_group(&mut self.d, &self.block, &[(0, n)]).map_err(|e| io::Error::other(e.to_string()))?;
+            self.pos = 0;
+        }
+        let n = buf.len().min(self.cur.len() - self.pos);
+        buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
     }
 }

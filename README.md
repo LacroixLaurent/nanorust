@@ -37,13 +37,27 @@ nanorust run -b mod_calls_FP27_ES1_tel1rif1rif2_RefBT1mono_modl610FT11.bam \
 |---|---|---|
 | `-o, --out-prefix` | | writes `<prefix>_nanoT_alldata.rds` and `<prefix>.bw` |
 | `--rds`, `--bw` | | explicit output paths (either can be omitted) |
-| `-t, --threads` | all cores | decompression + processing threads |
+| `-t, --threads` | all cores | **total** CPU cores used (see below) |
 | `--no-supplementary` | off | drop supplementary mappings (R keeps same-chrom/strand ones) |
 | `--max-dist` | 15000 | `supp_filter(max_dist=)` |
 | `--min-len` | 1 | `extract.local.signal(min_len=)` |
 | `--bin-size` | 1000 | signalbin bin size |
 | `--cov-bin-size` | 50 | bamCoverage `--binSize` |
 | `--exclude-prefix` | chrM | chromosomes excluded from the signal (step 01 `^chrM`) |
+
+### CPU budget (`-t`)
+
+`-t N` is the total number of cores the run uses, so it can be set to the CPUs allocated by
+HTCondor (`request_cpus`) or SLURM (`--cpus-per-task`):
+
+* `-t 1`: everything runs in one thread.
+* `-t 2`: one thread reads and decompresses, one processes records.
+* `-t N` (N ≥ 3): decompression and processing share N−1 compute slots; the remaining core is
+  left to the light file-reading and record-splitting threads. Output (RDS compression, then
+  bigWig) runs after processing, within the same N.
+
+Measured average busy cores on a 3.8 GB BAM: 0.99 (`-t 1`), 1.5 (`-t 2`), 2.3 (`-t 3`),
+3.5 (`-t 4`), 5.2 (`-t 6`). Results are identical for any `-t`.
 
 `-b -` reads the BAM from stdin, e.g. streaming from a server without a local copy:
 

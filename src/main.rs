@@ -1,5 +1,6 @@
 mod bam;
 mod bgzf;
+mod budget;
 mod coverage;
 mod rds;
 mod rstats;
@@ -41,7 +42,8 @@ struct RunArgs {
     /// Output coverage bigWig (overrides the prefix-derived name)
     #[arg(long)]
     bw: Option<PathBuf>,
-    /// Worker threads (default: all cores)
+    /// Total CPU cores to use (default: all cores). Decompression, processing and
+    /// output compression share this budget, e.g. set it to HTCondor/SLURM's allocated CPUs
     #[arg(short, long)]
     threads: Option<usize>,
     /// Drop supplementary mappings (default keeps them like parsing_DoradoRemora_v18_Br.r)
@@ -96,77 +98,94 @@ fn run(mut a: RunArgs) -> Result<()> {
     } else {
         Box::new(File::open(&a.bam).with_context(|| format!("opening {}", a.bam.display()))?)
     };
-    let mut reader = bgzf::ParallelBgzfReader::new(std::io::BufReader::with_capacity(1 << 20, input), threads);
-    let header = bam::read_header(&mut reader)?;
-    let chrom_names: Vec<String> = header.references.iter().map(|r| r.name.clone()).collect();
-    let cov = coverage::Coverage::new(&header, a.cov_bin_size);
+    let input = std::io::BufReader::with_capacity(1 << 20, input);
     let params = signal::Params {
         min_len: a.min_len,
         bin_size: a.bin_size,
         keep_supplementary: !a.no_supplementary,
         exclude_prefixes: a.exclude_prefix.clone(),
     };
+    let cov_bin = a.cov_bin_size;
 
-    let (tx, rx) = crossbeam_channel::bounded::<Batch>(threads * 2);
-    let (maps, counters) = std::thread::scope(|s| -> Result<_> {
-        let producer = s.spawn(move || -> Result<()> {
-            let mut batch = Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new() };
-            while bam::read_raw_record(&mut reader, &mut batch.data)? {
-                batch.ends.push(batch.data.len());
-                if batch.data.len() >= BATCH_BYTES {
-                    let full = std::mem::replace(
-                        &mut batch,
-                        Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new() },
-                    );
-                    if tx.send(full).is_err() {
-                        break;
-                    }
-                }
+    let (chrom_names, cov, maps, counters) = if threads == 1 {
+        // everything inline in this thread: exactly one core
+        let mut reader = bgzf::InlineBgzfReader::new(input);
+        let (chrom_names, cov) = read_header(&mut reader, cov_bin)?;
+        let mut w = Worker::new(&cov, &params, &chrom_names);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            if !bam::read_raw_record(&mut reader, &mut buf)? {
+                break;
             }
-            if !batch.ends.is_empty() {
-                let _ = tx.send(batch);
-            }
-            Ok(())
-        });
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                let rx = rx.clone();
-                let (cov, params, chrom_names) = (&cov, &params, &chrom_names);
-                s.spawn(move || -> Result<_> {
-                    let mut out = Vec::new();
-                    let mut cnt = signal::Counters::default();
-                    let mut scratch = signal::Scratch::default();
-                    for batch in rx {
-                        let mut from = 0;
-                        for &to in &batch.ends {
-                            let rec = bam::Record::parse(&batch.data[from..to])?;
-                            from = to;
-                            cnt.records += 1;
-                            if rec.flag & (bam::FLAG_UNMAPPED | bam::FLAG_SECONDARY) != 0 || rec.ref_id < 0 {
-                                continue;
-                            }
-                            cov.add(&rec);
-                            let name = &chrom_names[rec.ref_id as usize];
-                            if let Some(m) = signal::extract(&rec, name, params, &mut scratch, &mut cnt) {
-                                out.push(m);
-                            }
+            w.record(&buf)?;
+        }
+        let (maps, cnt) = (w.out, w.cnt);
+        (chrom_names, cov, maps, cnt)
+    } else {
+        // -t 2: one thread reads+inflates inline, one processes records.
+        // -t N>2: compute stages (inflate, process) share N-1 permits; the
+        // remaining core goes to the light block-reader and record-splitter threads.
+        let compute = threads - 1;
+        let budget = budget::Budget::new(compute);
+        let mut reader: Box<dyn std::io::Read + Send> = if threads == 2 {
+            Box::new(bgzf::InlineBgzfReader::new(input))
+        } else {
+            Box::new(bgzf::ParallelBgzfReader::new(input, compute, budget.clone()))
+        };
+        let (chrom_names, cov) = read_header(&mut reader, cov_bin)?;
+        let (tx, rx) = crossbeam_channel::bounded::<Batch>(compute * 2);
+        let (maps, cnt) = std::thread::scope(|s| -> Result<_> {
+            let producer = s.spawn(move || -> Result<()> {
+                let mut batch = Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new() };
+                while bam::read_raw_record(&mut reader, &mut batch.data)? {
+                    batch.ends.push(batch.data.len());
+                    if batch.data.len() >= BATCH_BYTES {
+                        let full = std::mem::replace(
+                            &mut batch,
+                            Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new() },
+                        );
+                        if tx.send(full).is_err() {
+                            break;
                         }
                     }
-                    Ok((out, cnt))
+                }
+                if !batch.ends.is_empty() {
+                    let _ = tx.send(batch);
+                }
+                Ok(())
+            });
+            let workers: Vec<_> = (0..compute)
+                .map(|_| {
+                    let rx = rx.clone();
+                    let (cov, params, chrom_names, budget) = (&cov, &params, &chrom_names, &budget);
+                    s.spawn(move || -> Result<_> {
+                        let mut w = Worker::new(cov, params, chrom_names);
+                        for batch in rx {
+                            let _permit = budget.acquire();
+                            let mut from = 0;
+                            for &to in &batch.ends {
+                                w.record(&batch.data[from..to])?;
+                                from = to;
+                            }
+                        }
+                        Ok((w.out, w.cnt))
+                    })
                 })
-            })
-            .collect();
-        drop(rx);
-        let mut maps = Vec::new();
-        let mut cnt = signal::Counters::default();
-        for w in workers {
-            let (m, c) = w.join().expect("worker panicked")?;
-            maps.extend(m);
-            cnt += c;
-        }
-        producer.join().expect("reader panicked")?;
-        Ok((maps, cnt))
-    })?;
+                .collect();
+            drop(rx);
+            let mut maps = Vec::new();
+            let mut cnt = signal::Counters::default();
+            for w in workers {
+                let (m, c) = w.join().expect("worker panicked")?;
+                maps.extend(m);
+                cnt += c;
+            }
+            producer.join().expect("reader panicked")?;
+            Ok((maps, cnt))
+        })?;
+        (chrom_names, cov, maps, cnt)
+    };
     eprintln!(
         "[{:.1}s] read {} records: {} candidate mappings, {} with signal{}",
         t0.elapsed().as_secs_f64(),
@@ -182,18 +201,52 @@ fn run(mut a: RunArgs) -> Result<()> {
     }
     eprintln!("[{:.1}s] {} mappings after supp_filter", t0.elapsed().as_secs_f64(), maps.len());
 
-    std::thread::scope(|s| -> Result<()> {
-        let bw_job = a.bw.as_ref().map(|p| s.spawn(|| cov.write_bigwig(p, 2)));
-        if let Some(p) = &a.rds {
-            write_rds(p, &maps, &chrom_names, a.rds_level, threads)?;
-            eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
+    // Outputs run one after the other so they never exceed the core budget.
+    if let Some(p) = &a.rds {
+        write_rds(p, &maps, &chrom_names, a.rds_level, threads)?;
+        eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
+    }
+    if let Some(p) = &a.bw {
+        cov.write_bigwig(p, 1)?;
+        eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
+    }
+    Ok(())
+}
+
+fn read_header<R: std::io::Read>(r: &mut R, cov_bin: u32) -> Result<(Vec<String>, coverage::Coverage)> {
+    let header = bam::read_header(r)?;
+    let names = header.references.iter().map(|r| r.name.clone()).collect();
+    Ok((names, coverage::Coverage::new(&header, cov_bin)))
+}
+
+/// Per-thread record processing: coverage + signal extraction.
+struct Worker<'a> {
+    cov: &'a coverage::Coverage,
+    params: &'a signal::Params,
+    chrom_names: &'a [String],
+    scratch: signal::Scratch,
+    out: Vec<signal::Mapping>,
+    cnt: signal::Counters,
+}
+
+impl<'a> Worker<'a> {
+    fn new(cov: &'a coverage::Coverage, params: &'a signal::Params, chrom_names: &'a [String]) -> Self {
+        Worker { cov, params, chrom_names, scratch: Default::default(), out: Vec::new(), cnt: Default::default() }
+    }
+
+    fn record(&mut self, data: &[u8]) -> Result<()> {
+        let rec = bam::Record::parse(data)?;
+        self.cnt.records += 1;
+        if rec.flag & (bam::FLAG_UNMAPPED | bam::FLAG_SECONDARY) != 0 || rec.ref_id < 0 {
+            return Ok(());
         }
-        if let Some(j) = bw_job {
-            j.join().expect("bigWig writer panicked")?;
-            eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), a.bw.as_ref().unwrap().display());
+        self.cov.add(&rec);
+        let name = &self.chrom_names[rec.ref_id as usize];
+        if let Some(m) = signal::extract(&rec, name, self.params, &mut self.scratch, &mut self.cnt) {
+            self.out.push(m);
         }
         Ok(())
-    })
+    }
 }
 
 /// Serializes in memory, then gzip-compresses chunks in parallel as
