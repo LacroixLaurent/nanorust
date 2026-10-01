@@ -1,8 +1,7 @@
 //! Minimal writer for R's serialization format (version 3, XDR), as produced
-//! by `saveRDS()` (gzip-compressed). Only the object types needed for the
-//! alldata tibble are implemented.
+//! by `saveRDS()` (gzip-compressed).
 
-use crate::signal::Mapping;
+use crate::signal::{Mapping, ModSpec};
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -31,9 +30,9 @@ impl<W: Write> RdsWriter<W> {
     pub fn new(mut w: W) -> io::Result<Self> {
         w.write_all(b"X\n")?;
         let mut s = RdsWriter { w, symbols: HashMap::new() };
-        s.int(3)?; // serialization version
-        s.int(0x0004_0403)?; // written by R 4.4.3
-        s.int(0x0003_0500)?; // readable by R >= 3.5.0
+        s.int(3)?;
+        s.int(0x0004_0403)?;
+        s.int(0x0003_0500)?;
         s.int(5)?;
         s.w.write_all(b"UTF-8")?;
         Ok(s)
@@ -111,7 +110,6 @@ impl<W: Write> RdsWriter<W> {
         self.int(NILVALUE_SXP)
     }
 
-    /// Attributes of a tibble: row.names, names, class.
     fn tibble_attrs(&mut self, names: &[&str], nrow: usize, compact_rownames: bool) -> io::Result<()> {
         self.attr_tag("row.names")?;
         if compact_rownames {
@@ -135,40 +133,84 @@ impl<W: Write> RdsWriter<W> {
         self.end_attrs()
     }
 
-    /// The step-04 `alldata` tibble:
-    /// read_id, flag, chrom, strand, start, end, signalbin, med_signal, med_signalbin
-    pub fn write_alldata(&mut self, maps: &[Mapping], chrom_levels: &[String]) -> io::Result<()> {
+    /// Écrit la tibble `alldata` regroupant toutes les modifications d'un même read dans une sous-tibble unique `signalbin`.
+    pub fn write_alldata(
+        &mut self,
+        maps: &[Mapping],
+        chrom_levels: &[String],
+        modspecs: &[ModSpec],
+    ) -> io::Result<()> {
         let n = maps.len();
+        let num_mods = modspecs.len();
+
+        // 1. Colonnes de la sous-tibble: "positions", "signalB", "signalE", ...
+        let signalbin_col_names: Vec<String> = std::iter::once("positions".to_string())
+            .chain(modspecs.iter().map(|ms| format!("signal{}", String::from_utf8_lossy(&ms.code))))
+            .collect();
+        let signalbin_col_refs: Vec<&str> = signalbin_col_names.iter().map(|s| s.as_str()).collect();
+
+        // 2. Colonnes de la tibble principale
+        let mut top_col_names: Vec<String> = vec![
+            "read_id".into(),
+            "flag".into(),
+            "chrom".into(),
+            "strand".into(),
+            "start".into(),
+            "end".into(),
+            "signalbin".into(),
+        ];
+
+        if num_mods == 1 {
+            top_col_names.push("med_signal".into());
+            top_col_names.push("med_signalbin".into());
+        } else {
+            for ms in modspecs {
+                let code_str = String::from_utf8_lossy(&ms.code);
+                top_col_names.push(format!("med_signal{}", code_str));
+                top_col_names.push(format!("med_signalbin{}", code_str));
+            }
+        }
+        let top_col_refs: Vec<&str> = top_col_names.iter().map(|s| s.as_str()).collect();
+
         self.int(VECSXP | IS_OBJECT | HAS_ATTR)?;
-        self.len(9)?;
-        // read_id
+        self.len(top_col_names.len())?;
+
+        // 1. read_id
         self.int(STRSXP)?;
         self.len(n)?;
         for m in maps {
             self.charsxp(&m.read_id)?;
         }
+        // 2. flag
         self.intsxp(0, maps.iter().map(|m| m.flag as i32))?;
+        // 3. chrom
         self.factor(maps.iter().map(|m| m.chrom as i32 + 1), chrom_levels)?;
+        // 4. strand
         let strand_levels = ["+".to_string(), "-".to_string(), "*".to_string()];
         self.factor(maps.iter().map(|m| if m.minus { 2 } else { 1 }), &strand_levels)?;
+        // 5. start
         self.realsxp(maps.iter().map(|m| m.start as f64))?;
+        // 6. end
         self.realsxp(maps.iter().map(|m| m.end as f64))?;
-        // signalbin: list of tibbles (positions, signalB)
+        // 7. signalbin (liste de tibbles multi-colonnes)
         self.int(VECSXP)?;
         self.len(n)?;
         for m in maps {
             self.int(VECSXP | IS_OBJECT | HAS_ATTR)?;
-            self.len(2)?;
-            self.realsxp(m.bins.iter().map(|b| b.0))?;
-            self.realsxp(m.bins.iter().map(|b| b.1))?;
-            self.tibble_attrs(&["positions", "signalB"], m.bins.len(), false)?;
+            self.len(1 + num_mods)?;
+            self.realsxp(m.bin_positions.iter().copied())?;
+            for mod_idx in 0..num_mods {
+                let sigs = &m.mod_bin_signals[mod_idx];
+                self.realsxp(sigs.iter().copied())?;
+            }
+            self.tibble_attrs(&signalbin_col_refs, m.bin_positions.len(), false)?;
         }
-        self.realsxp(maps.iter().map(|m| m.med_signal))?;
-        self.realsxp(maps.iter().map(|m| m.med_signalbin))?;
-        self.tibble_attrs(
-            &["read_id", "flag", "chrom", "strand", "start", "end", "signalbin", "med_signal", "med_signalbin"],
-            n,
-            true,
-        )
+        // 8.. med_signal / med_signalbin par modification
+        for mod_idx in 0..num_mods {
+            self.realsxp(maps.iter().map(|m| m.med_signals.get(mod_idx).copied().unwrap_or(f64::NAN)))?;
+            self.realsxp(maps.iter().map(|m| m.med_signalbins.get(mod_idx).copied().unwrap_or(f64::NAN)))?;
+        }
+
+        self.tibble_attrs(&top_col_refs, n, true)
     }
 }
