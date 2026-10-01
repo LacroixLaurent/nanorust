@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(version, about = "Fast nanoT BrdU parsing of dorado mod-call BAMs")]
+#[command(version, about = "Fast nanoT BrdU / multi-modification parsing of dorado mod-call BAMs")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -43,19 +43,17 @@ struct RunArgs {
     /// Output coverage bigWig (overrides the prefix-derived name)
     #[arg(long)]
     bw: Option<PathBuf>,
-    /// Total CPU cores to use (default: all cores). Decompression, processing and
-    /// output compression share this budget, e.g. set it to HTCondor/SLURM's allocated CPUs
+    /// Total CPU cores to use (default: all cores).
     #[arg(short, long)]
     threads: Option<usize>,
-    /// Modification to extract, as in the MM tag: <base><strand><code>, e.g. T+B (BrdU),
-    /// T+e (EdU), C+m (5mC), C+h (5hmC), A+a (6mA), or a ChEBI code like C+17802
-    #[arg(long = "mod", default_value = "T+B")]
-    modification: String,
-    /// Binarise probabilities for signalbin: prob < THR -> 0, else 1 (R's binarise/bin_thr).
-    /// med_signal is still computed on raw probabilities, as in R
+    /// Modification(s) to extract, as in the MM tag: <base><strand><code>, e.g. T+B, C+m, C+h.
+    /// Can be specified multiple times (--mod C+m --mod C+h) or comma-separated (--mod C+m,C+h).
+    #[arg(long = "mod", value_delimiter = ',', default_value = "T+B")]
+    modification: Vec<String>,
+    /// Binarise probabilities for signalbin: prob < THR -> 0, else 1.
     #[arg(long, value_name = "THR")]
     binarise: Option<f64>,
-    /// Drop supplementary mappings (default keeps them like parsing_DoradoRemora_v18_Br.r)
+    /// Drop supplementary mappings
     #[arg(long)]
     no_supplementary: bool,
     /// supp_filter max distance to the primary mapping
@@ -67,17 +65,16 @@ struct RunArgs {
     /// Bin size for signalbin
     #[arg(long, default_value_t = 1000)]
     bin_size: i64,
-    /// Bin size of the coverage bigWig (bamCoverage --binSize)
+    /// Bin size of the coverage bigWig
     #[arg(long, default_value_t = 50)]
     cov_bin_size: u32,
-    /// Chromosome name prefixes excluded from the signal (not from coverage)
+    /// Chromosome name prefixes excluded from the signal
     #[arg(long, default_value = "chrM", value_delimiter = ',')]
     exclude_prefix: Vec<String>,
-    /// gzip level of the RDS (R's saveRDS uses 6)
+    /// gzip level of the RDS
     #[arg(long, default_value_t = 6)]
     rds_level: u32,
-    /// Floating-point flavour of R's mean(): "x87" reproduces R on x86-64 Linux
-    /// (80-bit long double), "f64" reproduces R on arm64 macOS
+    /// Floating-point flavour of R's mean()
     #[arg(long, value_enum, default_value_t = FloatMode::X87)]
     float_mode: FloatMode,
 }
@@ -119,18 +116,24 @@ fn run(mut a: RunArgs) -> Result<()> {
         Box::new(File::open(&a.bam).with_context(|| format!("opening {}", a.bam.display()))?)
     };
     let input = std::io::BufReader::with_capacity(1 << 20, input);
+
+    let modspecs = a
+        .modification
+        .iter()
+        .map(|m| signal::ModSpec::parse(m))
+        .collect::<Result<Vec<_>>>()?;
+
     let params = signal::Params {
         min_len: a.min_len,
         bin_size: a.bin_size,
         keep_supplementary: !a.no_supplementary,
         exclude_prefixes: a.exclude_prefix.clone(),
-        modspec: signal::ModSpec::parse(&a.modification)?,
+        modspecs,
         bin_values: signal::Params::bin_values(a.binarise),
     };
     let cov_bin = a.cov_bin_size;
 
     let (chrom_names, cov, maps, counters) = if threads == 1 {
-        // everything inline in this thread: exactly one core
         let mut reader = bgzf::InlineBgzfReader::new(input);
         let (chrom_names, cov) = read_header(&mut reader, cov_bin)?;
         let mut w = Worker::new(&cov, &params, &chrom_names);
@@ -145,9 +148,6 @@ fn run(mut a: RunArgs) -> Result<()> {
         let (maps, cnt) = (w.out, w.cnt);
         (chrom_names, cov, maps, cnt)
     } else {
-        // -t 2: one thread reads+inflates inline, one processes records.
-        // -t N>2: compute stages (inflate, process) share N-1 permits; the
-        // remaining core goes to the light block-reader and record-splitter threads.
         let compute = threads - 1;
         let budget = budget::Budget::new(compute);
         let mut reader: Box<dyn std::io::Read + Send> = if threads == 2 {
@@ -209,7 +209,7 @@ fn run(mut a: RunArgs) -> Result<()> {
         (chrom_names, cov, maps, cnt)
     };
     eprintln!(
-        "[{:.1}s] read {} records: {} candidate mappings, {} with signal{}",
+        "[{:.1}s] read {} records: {} candidate mappings, {} modification mappings extracted{}",
         t0.elapsed().as_secs_f64(),
         counters.records,
         counters.candidates,
@@ -223,9 +223,8 @@ fn run(mut a: RunArgs) -> Result<()> {
     }
     eprintln!("[{:.1}s] {} mappings after supp_filter", t0.elapsed().as_secs_f64(), maps.len());
 
-    // Outputs run one after the other so they never exceed the core budget.
     if let Some(p) = &a.rds {
-        write_rds(p, &maps, &chrom_names, a.rds_level, threads)?;
+        write_rds(p, &maps, &chrom_names, &params.modspecs, a.rds_level, threads)?;
         eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
     }
     if let Some(p) = &a.bw {
@@ -241,7 +240,6 @@ fn read_header<R: std::io::Read>(r: &mut R, cov_bin: u32) -> Result<(Vec<String>
     Ok((names, coverage::Coverage::new(&header, cov_bin)))
 }
 
-/// Per-thread record processing: coverage + signal extraction.
 struct Worker<'a> {
     cov: &'a coverage::Coverage,
     params: &'a signal::Params,
@@ -264,18 +262,15 @@ impl<'a> Worker<'a> {
         }
         self.cov.add(&rec);
         let name = &self.chrom_names[rec.ref_id as usize];
-        if let Some(m) = signal::extract(&rec, name, self.params, &mut self.scratch, &mut self.cnt) {
-            self.out.push(m);
-        }
+        signal::extract(&rec, name, self.params, &mut self.scratch, &mut self.cnt, &mut self.out);
         Ok(())
     }
 }
 
-/// Serializes in memory, then gzip-compresses chunks in parallel as
-/// concatenated gzip members (read transparently by R's gzfile/readRDS).
-fn write_rds(path: &Path, maps: &[signal::Mapping], levels: &[String], level: u32, threads: usize) -> Result<()> {
+fn write_rds(path: &Path, maps: &[signal::Mapping], levels: &[String], modspecs: &[signal::ModSpec], level: u32, threads: usize
+    ) -> Result<()> {
     let mut w = rds::RdsWriter::new(Vec::with_capacity(64 << 20))?;
-    w.write_alldata(maps, levels)?;
+    w.write_alldata(maps, levels, modspecs)?;
     let raw = w.finish();
     const CHUNK: usize = 16 << 20;
     let chunks: Vec<&[u8]> = raw.chunks(CHUNK).collect();
@@ -309,7 +304,6 @@ fn write_rds(path: &Path, maps: &[signal::Mapping], levels: &[String], level: u3
     Ok(())
 }
 
-/// Base-level comparison of two bigWigs (interval layout may differ).
 fn bw_compare(a: &Path, b: &Path) -> Result<()> {
     let ra = coverage::read_bigwig(a)?;
     let rb = coverage::read_bigwig(b)?;
