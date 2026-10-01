@@ -386,8 +386,9 @@ pub fn extract(
             bin_positions = bins.iter().map(|b| b.0).collect();
         }
 
-        let mut bvals: Vec<f64> = bins.iter().map(|b| b.1).collect();
-        let med_signalbin = r_median(&mut bvals);
+        let bvals: Vec<f64> = bins.iter().map(|b| b.1).collect();
+        let mut bvals_for_med = bvals.clone();
+        let med_signalbin = r_median(&mut bvals_for_med);
 
         mod_bin_signals.push(bvals);
         med_signals.push(med_signal);
